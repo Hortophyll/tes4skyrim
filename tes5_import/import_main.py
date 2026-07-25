@@ -40,6 +40,7 @@ from .skyrim_overrides import (
 )
 from .navi_builder import NAVI_SINGLETON_FID, build_navi_record
 from .locations import build_marker_locations
+from .record_types.dialog_misc import convert_WTHR
 from .record_types.world import (
     convert_ACHR,
     convert_CELL,
@@ -247,7 +248,7 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
     _phase_done('parse export text')
 
     for sig in sorted(by_type.keys()):
-        special_types = {'LTEX', 'SOUN', 'CELL', 'WRLD', 'REFR', 'ACHR', 'ACRE', 'LAND', 'DIAL', 'INFO'}
+        special_types = {'LTEX', 'SOUN', 'WTHR', 'CELL', 'WRLD', 'REFR', 'ACHR', 'ACRE', 'LAND', 'DIAL', 'INFO'}
         status = "SKIP" if sig in all_skip else ("CONVERT" if sig in IMPORT_DISPATCH or sig in special_types else "UNKNOWN")
         print(f"  {sig}: {len(by_type[sig])} records [{status}]")
 
@@ -598,6 +599,33 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
                 converted += 1
             except Exception as e:
                 print(f"  ERROR converting LTEX '{get_str(rec, 'EditorID', '?')}': {e}")
+                errors += 1
+
+    # --- Phase 2b: WTHR (creates IMGS companion records) ---
+    # Skyrim has no per-weather HDR field: tone mapping lives in an imagespace
+    # the weather points at, so each converted weather mints an IMGS from its
+    # TES4 HNAM block.  Serial, like the other companion-allocating phases, so
+    # writer.alloc_formid() stays deterministic.
+    wthr_records = by_type.get('WTHR', [])
+    if wthr_records:
+        print(f"  Converting {len(wthr_records)} WTHR records (with IMGS creation)...")
+        for rec in wthr_records:
+            try:
+                ov = ctx.build(rec, 'WTHR') if ctx else None
+                if ov is not None:
+                    # An override reuses the master's record and its IMGS
+                    # companion; converting fresh would mint a duplicate.
+                    if ov.record_bytes:
+                        writer.add_record('WTHR', ov.record_bytes)
+                        converted += 1
+                    continue
+                wthr_bytes, imgs_list = convert_WTHR(rec, writer)
+                for imgs_bytes in imgs_list:
+                    writer.add_record('IMGS', imgs_bytes)
+                writer.add_record('WTHR', wthr_bytes)
+                converted += 1
+            except Exception as e:
+                print(f"  ERROR converting WTHR '{get_str(rec, 'EditorID', '?')}': {e}")
                 errors += 1
 
     # --- Phase 3: SOUN (creates SNDR companion records) ---

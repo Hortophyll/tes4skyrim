@@ -153,10 +153,223 @@ def convert_SOUN(rec: dict, writer=None) -> tuple:
     return soun_bytes, sndr_bytes, sndr_fid
 
 
-# Skyrim.esm's default imagespace, used by every vanilla WTHR's IMSP slots.
-# TES4 has no IMGS records (its tone mapping lives in the weather's own HNAM),
-# so converted weathers inherit Skyrim's default rather than a null pointer.
+# Skyrim.esm 0x161 'DefaultImageSpaceExterior'.  ONLY a last-resort fallback
+# for a weather whose TES4 record carries no HNAM — see _wthr_imgs for why it
+# must not be used as the general target.
 _DEFAULT_IMGS = 0x00000161
+
+# --- HDR tone mapping: TES4 WTHR.HNAM -> TES5 IMGS.HNAM --------------------
+#
+# This is the field that decides overall scene exposure, and the two games put
+# it in DIFFERENT RECORDS: Oblivion stores HDR per WEATHER (WTHR.HNAM, 14
+# floats), Skyrim stores it in an IMAGESPACE that the weather points at
+# (WTHR.IMSP -> IMGS.HNAM, 9 floats).  There is no TES5 WTHR field for it.
+#
+# Pointing every converted weather at the stock 0x161 is NOT a valid
+# conversion: 0x161 is one of only two vanilla imagespaces that ship ENAM and
+# NO HNAM (the other is 0x160 Interior), so the HDR block is left undefined and
+# the scene renders blown-out at every hour.  332 of the 336 IMSP references in
+# Skyrim.esm point at imagespaces that DO have an HNAM.  So convert the TES4
+# HDR data into a real IMGS per weather.
+#
+# Field correspondence (xEdit wbDefinitionsTES5 IMGS/HNAM + UESP
+# 'Skyrim Mod:Mod File Format/IMGS', whose note names slots 5/6 the
+# "target luminance" pair — i.e. exactly TES4's TargetLum/UpperLumClamp):
+#
+#   TES5 slot            <- TES4 WTHR.HNAM field       units
+#   0 Eye Adapt Speed    <- EyeAdaptSpeed              DIFFERENT (see below)
+#   1 Bloom Blur Radius  <- BlurRadius                 same (both 0..8)
+#   2 Bloom Threshold    <- BrightClamp                same 0..1-ish
+#   3 Bloom Scale        <- BrightScale                same 0..3
+#   4 Recv Bloom Thresh  <- TargetLum                  same 0..1.2
+#   5 White              <- UpperLumClamp              same ~1.0
+#   6 Sunlight Scale     <- SunlightDimmer             same 0..2
+#   7 Sky Scale          <- (no TES4 source)           vanilla median 0.127
+#   8 Eye Adapt Strength <- (no TES4 source)           vanilla median 11.0
+#
+# EyeAdaptSpeed is the one genuine UNIT change.  Oblivion's is a 0..1 rate
+# (`fEyeAdaptSpeed:BlurShaderHDR`, engine default 0.7 — the setting is in
+# Oblivion.ini and named in Oblivion.exe at 0xA3E965); Skyrim's spans 7..100
+# across the 268 vanilla imagespaces (median 37).  Copying 0.7 into a field
+# the engine reads on a 7..100 scale all but freezes eye adaptation, so the
+# TES4 0..1 rate is mapped onto the vanilla range.
+_TES4_EYE_ADAPT_DEFAULT = 0.7
+
+# Per-field (min, max) observed across the 213 vanilla imagespaces that a
+# Skyrim.esm WEATHER actually references.  Interior/dungeon imagespaces are
+# excluded: they are half the 268 total and pull the envelope somewhere no
+# outdoor weather ever sits.
+#
+# Every converted value is clamped into this envelope, because a TES4 value
+# outside it is not merely unusual — it is degenerate for Skyrim's tonemapper.
+# `DefaultWeather`, the weather the engine falls back to for the 57
+# worldspaces with no CNAM (Tamriel and every city), ships an ALL-ZERO HNAM in
+# Oblivion.esm; copied verbatim that gives White=0 and SunlightScale=0, i.e. a
+# zero white point, and the whole scene renders blown out at every hour.
+_IMGS_HNAM_RANGES = (
+    (15.0, 50.0),    # 0 Eye Adapt Speed
+    (0.8, 8.0),      # 1 Bloom Blur Radius
+    (0.0, 0.80),     # 2 Bloom Threshold
+    (0.0, 7.0),      # 3 Bloom Scale
+    (0.2, 1.0),      # 4 Receive Bloom Threshold
+    (0.6, 1.075),    # 5 White
+    (0.4, 3.85),     # 6 Sunlight Scale
+    (0.0, 0.45),     # 7 Sky Scale
+    (1.0, 30.0),     # 8 Eye Adapt Strength
+)
+
+# TES5 gives a weather FOUR imagespaces, one per time of day, and 59 of the 84
+# vanilla weathers (70%) really do use distinct ones — day and night differ a
+# lot.  TES4 has a single HDR block per weather with no time axis, so the
+# fields TES4 cannot supply are taken from the vanilla PER-SLOT medians
+# (measured over all 84 weathers x their 4 slots):
+#
+#                    Sunrise   Day   Sunset  Night
+#   Bloom Threshold    0.375  0.625   0.475  0.375
+#   Eye Adapt Speed   37      40     37     45
+#   Eye Adapt Strength 15      5      15     20
+#   Sky Scale          0.175  0.210   0.200  0.035
+#
+# Collapsing all four slots onto one imagespace (the first version) gave day
+# and night identical tone mapping.
+_IMGS_SLOT_NAMES = ('Dawn', 'Day', 'Dusk', 'Night')
+_IMGS_SLOT_EYE_ADAPT_STRENGTH = (15.0, 5.0, 15.0, 20.0)
+# Eye-adapt speed multiplier relative to the weather's own TES4 rate, so an
+# authored TES4 value still drives the result but keeps vanilla's day/night
+# shape (medians 37/40/37/45 -> normalised against the 40 day value).
+_IMGS_SLOT_EYE_ADAPT_BIAS = (0.925, 1.0, 0.925, 1.125)
+# Vanilla also dims Sunlight Scale after dark (per-slot medians
+# 1.85/1.90/1.85/1.50); TES4 has one value for the whole day.
+_IMGS_SLOT_SUNLIGHT_BIAS = (0.974, 1.0, 0.974, 0.789)
+
+# Sky Scale is the sky's contribution to scene exposure and TES4 has no
+# equivalent field.  It tracks how bright the weather's own sky colour is
+# (corr +0.29 over 284 vanilla weather/slot pairs): a dark night sky sits at
+# ~0.025 while any lit sky sits at ~0.19-0.21.  A flat value washes the day
+# sky out to near-white while over-lighting the night.
+_IMGS_SKY_SCALE_DARK = 0.025
+_IMGS_SKY_SCALE_LIT = 0.20
+_IMGS_SKY_LUM_DARK = 40.0     # sky luminance below which the bucket is "dark"
+
+# Bloom threshold decides how much of the frame blooms — LOWER means MORE of
+# the image blows out.  TES4's BrightClamp is a different curve and its values
+# (median 0.30) sit well under vanilla's day figure, which is what produced
+# the excessive bloom.  Blend the authored TES4 value toward the vanilla
+# per-slot median so an authored difference still shows without the haze.
+_IMGS_SLOT_BLOOM_THRESHOLD = (0.375, 0.625, 0.475, 0.375)
+_IMGS_BLOOM_TES4_WEIGHT = 0.35
+
+# Several TES4 HDR fields occupy a DIFFERENT numeric range from the TES5 field
+# they feed, so a raw copy lands at (or past) the TES5 ceiling:
+#
+#   field           TES4 observed   TES5 weather-used   effect of copying raw
+#   TargetLum        0.75 .. 1.20    0.20 .. 1.00       pinned at 1.0 -> the
+#                                                        WHOLE frame blooms
+#   UpperLumClamp    1.00 .. 1.30    0.60 .. 1.075      pinned at the ceiling
+#   SunlightDimmer   0.50 .. 2.00    0.40 .. 3.85       usable, but compressed
+#                                                        into the dim half
+#
+# Map each from its TES4 span onto the vanilla span so relative differences
+# between weathers survive while absolute values land where Skyrim expects.
+# (lo_in, hi_in, lo_out, hi_out)
+_IMGS_FIELD_RESCALE = {
+    'TargetLum':      (0.75, 1.20, 0.42, 0.60),
+    'UpperLumClamp':  (1.00, 1.30, 0.88, 1.02),
+    'SunlightDimmer': (0.50, 2.00, 0.90, 2.70),
+    'BrightScale':    (1.00, 3.00, 2.50, 4.00),
+}
+
+# Bloom Blur Radius is 7.0 in ALL 213 vanilla weather-used imagespaces — it is
+# an engine constant, not authored data.  TES4's BlurRadius belongs to
+# Oblivion's own blur pass (a different quantity that happens to share a name)
+# and ranges 4..8; feeding it through made the bloom kernel too tight.
+_IMGS_BLOOM_BLUR_RADIUS = 7.0
+
+
+def _rescale(name: str, value: float, default: float) -> float:
+    """Map a TES4 HDR value from its own range onto the vanilla TES5 range."""
+    span = _IMGS_FIELD_RESCALE.get(name)
+    if span is None:
+        return value
+    lo_in, hi_in, lo_out, hi_out = span
+    if hi_in <= lo_in:
+        return default
+    t = (value - lo_in) / (hi_in - lo_in)
+    t = min(max(t, 0.0), 1.0)
+    return lo_out + t * (hi_out - lo_out)
+
+
+def _sky_luminance(rec: dict, time: int) -> float:
+    """Rec.709 luminance of the weather's Sky-Upper colour at a time of day."""
+    raw = get_hex_bytes(rec, 'NAM0.Data')
+    if not raw or len(raw) < 160:
+        return _IMGS_SKY_LUM_DARK
+    o = (_T4_SKY_UPPER * 4 + time) * 4
+    return 0.299 * raw[o] + 0.587 * raw[o + 1] + 0.114 * raw[o + 2]
+
+
+def _wthr_imgs(rec: dict, imgs_fid: int, time: int) -> bytes:
+    """Build one time-of-day IMGS carrying this weather's HDR tone mapping."""
+    # A TES4 weather whose whole HNAM block is zero has no authored HDR at all
+    # (Oblivion's CS supplied the defaults, so the record was never filled in).
+    # DefaultWeather is one, and it is the weather the 57 CNAM-less
+    # worldspaces fall back to.  Clamping those zeros to the range MINIMUM
+    # pins every field at its darkest/flattest legal value; fall back to the
+    # vanilla per-slot defaults instead, which is what Oblivion itself did.
+    authored = any(
+        get_float(rec, 'HNAM.' + f, 0.0) != 0.0
+        for f in ('EyeAdaptSpeed', 'BlurRadius', 'TargetLum', 'UpperLumClamp',
+                  'BrightScale', 'BrightClamp', 'SunlightDimmer'))
+
+    def h(field, default=0.0):
+        if not authored:
+            return default
+        return _rescale(field, get_float(rec, 'HNAM.' + field, default), default)
+
+    # Oblivion 0..1 adaptation rate -> Skyrim's scale, then biased per slot.
+    speed = max(0.0, min(1.0, h('EyeAdaptSpeed', _TES4_EYE_ADAPT_DEFAULT)))
+    lo, hi = _IMGS_HNAM_RANGES[0]
+    eye_adapt = (lo + speed * (hi - lo)) * _IMGS_SLOT_EYE_ADAPT_BIAS[time]
+
+    # Bloom threshold: blend TES4's BrightClamp toward the vanilla slot median.
+    w = _IMGS_BLOOM_TES4_WEIGHT
+    bloom_threshold = (w * h('BrightClamp', _IMGS_SLOT_BLOOM_THRESHOLD[time])
+                       + (1.0 - w) * _IMGS_SLOT_BLOOM_THRESHOLD[time])
+
+    # Sky Scale: ramp from the dark-sky value to the lit-sky value across the
+    # luminance band where vanilla transitions, rather than stepping, so a
+    # dim-but-not-black dawn sky does not jump to the full daytime value.
+    lum = _sky_luminance(rec, time)
+    t = min(max((lum - _IMGS_SKY_LUM_DARK) / _IMGS_SKY_LUM_DARK, 0.0), 1.0)
+    sky_scale = (_IMGS_SKY_SCALE_DARK
+                 + t * (_IMGS_SKY_SCALE_LIT - _IMGS_SKY_SCALE_DARK))
+
+    # Defaults are the vanilla weather-used medians, so a weather with no
+    # authored TES4 HDR renders like a normal Skyrim exterior.
+    values = [
+        eye_adapt,
+        _IMGS_BLOOM_BLUR_RADIUS,     # Bloom Blur Radius (constant in vanilla)
+        bloom_threshold,             # Bloom Threshold
+        h('BrightScale', 3.0),       # Bloom Scale
+        h('TargetLum', 0.575),       # Receive Bloom Threshold
+        h('UpperLumClamp', 0.95),    # White
+        h('SunlightDimmer', 1.9) * _IMGS_SLOT_SUNLIGHT_BIAS[time],
+        sky_scale,
+        _IMGS_SLOT_EYE_ADAPT_STRENGTH[time],
+    ]
+    values = [min(max(v, lo), hi)
+              for v, (lo, hi) in zip(values, _IMGS_HNAM_RANGES)]
+    hnam = struct.pack('<9f', *values)
+
+    edid = get_str(rec, 'EditorID') or f"WTHR{get_formid(rec, 'FormID'):08X}"
+    subs = pack_string_subrecord(
+        'EDID', f'TES4_{edid}_IMGS{_IMGS_SLOT_NAMES[time]}')
+    subs += pack_subrecord('HNAM', hnam)
+    # Neutral cinematic/tint: TES4 has no equivalent, and every vanilla IMGS
+    # with an HNAM also ships CNAM+TNAM.
+    subs += pack_subrecord('CNAM', struct.pack('<3f', 1.0, 1.0, 1.0))
+    subs += pack_subrecord('TNAM', struct.pack('<4f', 0.0, 1.0, 1.0, 1.0))
+    return pack_record('IMGS', imgs_fid, 0, subs)
 
 # EditorIDs Oblivion and Skyrim both use.  Ours is remapped into index 01 and
 # would otherwise make the CK rename it to '<name>DUPLICATE001'.
@@ -411,8 +624,8 @@ def _wthr_dalc(rec: dict) -> bytes:
     return out
 
 
-def convert_WTHR(rec: dict) -> bytes:
-    """WTHR — Weather conversion.
+def convert_WTHR(rec: dict, writer=None) -> tuple:
+    """WTHR — Weather conversion.  Returns (wthr_bytes, [imgs_bytes, ...]).
 
     TES5 subrecord order (from wbDefinitionsTES5.pas):
     EDID, DNAM/CNAM/ANAM/BNAM (old, unused), cloud textures (00TX..O0TX),
@@ -420,6 +633,23 @@ def convert_WTHR(rec: dict) -> bytes:
     DATA, NAM1, SNAM(sounds), TNAM(sky statics), IMSP, HNAM(SSE volumetric),
     DALC x4, NAM2, NAM3, MODL/MODT(aurora), GNAM
     """
+    # HDR tone mapping lives in companion IMGS records in TES5 — see
+    # _wthr_imgs.  FOUR of them, one per time of day, because day and night
+    # tone mapping differ substantially and 70% of vanilla weathers ship
+    # distinct imagespaces per slot.  Every weather gets them, including those
+    # whose TES4 HNAM is all zeros (DefaultWeather): the clamp in _wthr_imgs
+    # turns those into the vanilla floor rather than a degenerate zero white
+    # point.  A caller with no writer (unit tests exercising the WTHR bytes
+    # alone) falls back to stock.
+    imgs_bytes = []
+    imgs_fids = [_DEFAULT_IMGS] * 4
+    if writer is not None:
+        imgs_fids = []
+        for time in range(4):
+            fid = writer.alloc_formid()
+            imgs_fids.append(fid)
+            imgs_bytes.append(_wthr_imgs(rec, fid, time))
+
     subs = b''
     edid = get_str(rec, 'EditorID')
     if edid:
@@ -515,16 +745,16 @@ def convert_WTHR(rec: dict) -> bytes:
         if sfid:
             subs += pack_subrecord('SNAM', struct.pack('<II', sfid, stype))
 
-    # IMSP — Image Spaces (sunrise/day/sunset/night).  TES4 drives tone
-    # mapping from the weather's own HNAM HDR block, which TES5 moved into
-    # IMGS records; point at Skyrim's default imagespace (0x161) as every
-    # vanilla record does rather than leaving four null FormIDs.
-    subs += pack_subrecord('IMSP', struct.pack('<IIII', *([_DEFAULT_IMGS] * 4)))
+    # IMSP — Image Spaces (sunrise/day/sunset/night), each pointing at the
+    # matching time-of-day IMGS built from this weather's TES4 HDR block.
+    subs += pack_subrecord('IMSP', struct.pack('<IIII', *imgs_fids))
 
     # DALC — Directional Ambient Lighting Colors (4 x 32 bytes)
     subs += _wthr_dalc(rec)
 
-    return pack_record('WTHR', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)
+    wthr_bytes = pack_record('WTHR', get_formid(rec, 'FormID'),
+                             get_int(rec, 'RecordFlags'), subs)
+    return wthr_bytes, imgs_bytes
 
 
 # Skyrim's night-sky mesh.  TES4 climates point MODL at their own stars mesh

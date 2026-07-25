@@ -231,7 +231,6 @@ def _init_dispatch():
     )
     from .record_types.dialog_misc import (
         convert_CLMT,
-        convert_WTHR,
     )
     from .record_types.equipment import (
         convert_ALCH,
@@ -334,7 +333,9 @@ def _init_dispatch():
         # PACK is converted in its own phase (import_main 3b2), not here — it
         # needs the QUST aliases, which the generic dispatch runs too early for.
         'WATR': convert_WATR,
-        'WTHR': convert_WTHR,
+        # WTHR is NOT in the generic dispatch: it mints an IMGS companion for
+        # its HDR tone mapping, so it runs in its own serial phase
+        # (import_main Phase 2b) where writer.alloc_formid() is deterministic.
         'CLMT': convert_CLMT,
     })
 
