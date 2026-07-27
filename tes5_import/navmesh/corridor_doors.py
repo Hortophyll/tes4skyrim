@@ -26,7 +26,15 @@ import math
 from . import params
 
 DOOR_BRIDGE_RADIUS = 220.0
+# Fallback half-width, used only when a door model has no measured panel width
+# (see pgrd_to_navm._DOOR_WIDTH).  Real widths come from the collision panel.
 DOOR_LINE_HALF = 45.0
+# A doorway narrower than this cannot be walked anyway, and one wider than this
+# is a gate/portcullis whose full span would swallow the room.  Vanilla door
+# triangles have a median minimum width of 90u, so the floor keeps the quad
+# wide enough to stand in.
+DOOR_LINE_HALF_MIN = 45.0
+DOOR_LINE_HALF_MAX = 220.0
 # How far from each end the bridge collision walk is skipped.  A door REFR is a
 # placed mesh standing ON the threshold, so a walk starting at the door hits the
 # door panel itself and rejects every candidate; the corridor end is skipped by
@@ -41,7 +49,7 @@ DOOR_MIN_DEPTH = 64.0
 DOOR_OVERLAP = 32.0
 
 
-def door_footprints(verts, tris, doors, wall_hit=None):
+def door_footprints(verts, tris, doors, wall_hit=None, nodes=None):
     """Per door, the base line + connecting footprint to feed the union.
 
     Returns a list of dicts, one per door that has a reachable corridor edge:
@@ -75,7 +83,7 @@ def door_footprints(verts, tris, doors, wall_hit=None):
             a, b = t[k], t[(k + 1) % 3]
             edges.add((a, b) if a < b else (b, a))
 
-    for (dx, dy, dz, rz, _is_tp) in doors:
+    for (dx, dy, dz, rz, _is_tp, door_w) in doors:
         # Rank every candidate corridor edge by distance, then take the NEAREST
         # one the door can reach WITHOUT crossing a wall.  A blocked candidate is
         # never used — it is skipped and the search continues outward to the next
@@ -103,23 +111,63 @@ def door_footprints(verts, tris, doors, wall_hit=None):
             cands.append((d2, mx, my, a, b))
         cands.sort(key=lambda c: c[0])
 
+        # Which side the actor walks in from, decided by the PATHGRID -- the
+        # only input that asserts "an actor walks here".  Derived ribbon edges
+        # run past BOTH faces of most doorways, so nearest-edge / majority /
+        # distance-weighted votes all disagreed with the pathgrid on ~47% of
+        # doors; the nearest NODE is unambiguous.
+        want_side = 0
+        if nodes:
+            ftx, fty = math.cos(rz), math.sin(rz)   # == fx,fy below
+            bn = None
+            for n in nodes:
+                proj = (n[0] - dx) * ftx + (n[1] - dy) * fty
+                if abs(proj) < 1.0:
+                    continue
+                d2n = (n[0] - dx) ** 2 + (n[1] - dy) ** 2
+                if bn is None or d2n < bn[0]:
+                    bn = (d2n, proj)
+            if bn is not None:
+                want_side = 1 if bn[1] > 0 else -1
+
         best = None
         for (d2, mx, my, a, b) in cands:
             if wall_hit is not None and _blocked_between(
                     wall_hit, dx, dy, dz, mx, my):
                 continue
-            best = (d2, a, b)
+            best = (d2, a, b, mx, my)
             break
         if best is None:
             continue
 
-        _d2, ea, eb = best
+        _d2, ea, eb, emx, emy = best
         # Sit the footprint on the CORRIDOR's height: the quad has to meet the
         # ribbon it bridges to, and the door REFR's own z is only approximate.
         storey_z = 0.5 * (verts[ea][2] + verts[eb][2])
-        tx, ty = math.cos(rz), math.sin(rz)
-        blx, bly = dx + tx * DOOR_LINE_HALF, dy + ty * DOOR_LINE_HALF
-        brx, bry = dx - tx * DOOR_LINE_HALF, dy - ty * DOOR_LINE_HALF
+        # A door mesh's LOCAL +X points THROUGH the opening and local +Y runs
+        # ALONG the threshold: measured on impdundoor01.nif, whose panel is
+        # 5.6u thick in X and 115.3u wide in Y — a panel is thin through the
+        # doorway and wide across it.  `_door_threshold` agrees: it rotates the
+        # hinge->doorway-centre offset (which lies along local X) by the same
+        # standard matrix, so local +X == (cos rz, sin rz) is the FACING.
+        #
+        # Using the facing as the base line laid the threshold across the axis
+        # the door actually opens along — every door quad rotated 90 degrees
+        # from its real opening, visible as a sideways door line in
+        # navmesh_preview.  The base line is local +Y.
+        tx, ty = -math.sin(rz), math.cos(rz)
+        # Span the REAL doorway.  Door panels run from 16u to 764u wide (median
+        # 121), measured off each model's collision panel, so the old constant
+        # 90u base line was simply the wrong size for most doors: on
+        # impdundoor01 (115u) it left the first 30u of the threshold with no
+        # mesh under it, and the Door Triangle came out a 571-unit scrap — below
+        # the smallest of 1,659 vanilla door triangles (min 992, median 9,614),
+        # too narrow for an actor to stand on.  That is what stopped the
+        # CharacterGen assassins dead at their cell door.
+        half = 0.5 * door_w if door_w else DOOR_LINE_HALF
+        half = max(DOOR_LINE_HALF_MIN, min(half, DOOR_LINE_HALF_MAX))
+        blx, bly = dx + tx * half, dy + ty * half
+        brx, bry = dx - tx * half, dy - ty * half
 
         # The footprint is a RECTANGLE: the door base line, swept to the corridor
         # along the door's facing.  Using the corridor edge's own two endpoints as
@@ -143,13 +191,48 @@ def door_footprints(verts, tris, doors, wall_hit=None):
         # deep enough to actually overlap the corridor it is bridging to, so the
         # depth is floored at DOOR_MIN_DEPTH and pushed PAST the corridor edge by
         # DOOR_OVERLAP, guaranteeing the union merges the two.
-        fx, fy = -ty, tx
-        depth = (mx - dx) * fx + (my - dy) * fy
-        sign = -1.0 if depth < 0 else 1.0
+        # Facing = local +X = perpendicular to the base line (tx, ty).
+        fx, fy = ty, -tx
+        # WHICH WAY the quad sweeps.  A door has two faces 180 degrees apart
+        # and only one of them leads to this cell's walkable ground, so the
+        # side is decided by the PATHGRID, not by the door's rotation.
+        #
+        # The nearest corridor EDGE midpoint is not a reliable proxy: a ribbon
+        # usually runs past both faces of a doorway, so the closest edge often
+        # sits behind the door.  Measured across four cells, 14 of 30 quads
+        # (47%) were built on the wrong side that way — the quad then bridged
+        # to ground the actor cannot reach through this door.
+        #
+        # A door has two faces 180 degrees apart and the quad must sweep toward
+        # the one the actor actually walks in from.  That side is decided by
+        # the PATHGRID -- the only thing in the input that asserts "an actor
+        # walks here" -- and specifically by the NEAREST PATHGRID NODE.
+        #
+        # Derived corridor-ribbon edges are not a usable proxy: a ribbon runs
+        # past the far face of most doorways too, so nearest-edge, majority and
+        # distance-weighted votes all disagreed with the pathgrid on ~47% of
+        # doors.  The node itself is unambiguous.
+        # Sweep toward the side the PATHGRID says the door serves.  Derived
+        # ribbon edges run past BOTH faces of most doorways, so nearest-edge,
+        # majority and distance-weighted votes all disagreed with the pathgrid
+        # on 14 of 30 doors; keying on the nearest NODE cut that to 2.
+        depth = (emx - dx) * fx + (emy - dy) * fy
+        if want_side:
+            sign = 1.0 if want_side > 0 else -1.0
+        elif abs(depth) > 1e-6:
+            sign = -1.0 if depth < 0 else 1.0
+        else:
+            sign = -1.0 if (mx - dx) * fx + (my - dy) * fy < 0 else 1.0
         depth = sign * max(abs(depth) + DOOR_OVERLAP, DOOR_MIN_DEPTH)
         flx, fly = blx + fx * depth, bly + fy * depth
         frx, fry = brx + fx * depth, bry + fy * depth
 
+        # The quad spans EXACTLY the doorway — never wider.  Widening it past
+        # the door line (an earlier attempt to keep the ribbon's outline
+        # corners off the threshold) pushes the footprint through the wall on
+        # either side of the frame.  The door triangle is protected instead by
+        # reserving it out of the triangulation entirely; see
+        # corridor_union._triangulate.
         poly = [(blx, bly), (brx, bry), (frx, fry), (flx, fly)]
         out.append({'base': ((blx, bly), (brx, bry)),
                     'poly': poly, 'z': storey_z})

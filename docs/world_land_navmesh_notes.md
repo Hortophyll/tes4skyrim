@@ -106,6 +106,204 @@ cell PLUS a single top-level NAVI (Navmesh Info Map). Implemented in
   XPGloomstonePassage02 until fixed). Runs BEFORE `_prune_islands` so the size
   gate judges final component sizes.
 
+### 🔴 Drop-down storeys arrive as separate components (found 2026-07-26)
+
+**Symptom:** CharacterGen's Ambush A never fired. The Mythic Dawn assassins sit
+in a holding cell that teleports (a door pair, both refs in the SAME cell) onto
+a mezzanine they are *meant to step off* into the ambush room below. The
+mezzanine and the room floor came out as two disconnected navmesh components, so
+`CGAssassinsAmbushA4` could never complete, its `OnPackageEnd` never set stage
+23, and A1/A2/A3 — gated `GetStage >= 23` — stayed parked in
+`DefaultMasterPackage` forever. In game the assassin visibly walks *into* the
+door instead of through it.
+
+**Cause — and it is NOT a navmesh defect.** Oblivion has no pathgrid edge for a
+DROP. A balcony and the floor beneath it are two disconnected pathgrid islands
+and the actor simply steps off. Verified in the source data: cell 0001FBB9's
+PGRD has **zero** edges between the pen (points 268–272, z=-594), the mezzanine
+(z=-640) and the room floor (z=-832), and its single RefMap entry covers neither
+door. Our navmesh reproduces the pathgrid faithfully, islands included — so the
+faithfulness is what produced the break. Skyrim has no "step off here" construct
+either; connectivity IS the mesh.
+
+**Fix:** `corridor_clean._bridge_islands` (params `ISLAND_BRIDGE_*`) welds two
+components whose boundary edges nearly meet in plan but are separated in Z, with
+two triangles across the lip. Measured geometry: the closest main-floor/mezzanine
+boundary-edge pair is 33u apart in plan with a 192u drop, so `ISLAND_BRIDGE_XY`
+is 40 (half a ribbon width — the next distinct lip is 58u) and the drop window is
+`MAX_CLIMB`..220u.
+
+Three things make this safe, and all three matter:
+- **Both sides must ALREADY be separate components.** Stairs, ramps and any
+  genuinely-connected storeys are one component and never enter the candidate
+  set, so this cannot weld a tower together.
+- **The quad must be split so each source boundary edge is used exactly twice
+  overall.** `edge_adjacency` links an edge shared by exactly two triangles and
+  refuses one shared by three: the naive split leaves the bridge hanging off
+  nothing and *leaks stray 1-triangle components* (measured: components went UP,
+  953 → 971). Endpoints are paired by proximity first, or the quad
+  self-intersects and welds nothing.
+- **Verify the outcome, don't predict it.** A join is kept only if it actually
+  reduces the component count; rejected pairs go in a `tried` set. Cheaper than
+  reasoning about every way a boundary edge can already be shared.
+
+Measured over 250 multi-component interiors: 30 meshes bridged, 40 joins, **0
+made worse**, components 953 → 913. Runs BEFORE `_drop_unreachable_islands` so a
+bridged mezzanine is part of the main surface rather than culled as a scrap.
+
+### Door threshold axis comes from the COLLISION PANEL, never the bbox
+
+Which local axis a door's threshold runs along decides the whole quad's
+orientation. It is read from the door's **collision panel** — the body the
+engine collides with — in `asset_convert.collision_extract.door_panel_axis_from_data`,
+cached to `door_panel_axis_cache.json` by `tools/build_door_axis_cache.py`:
+
+> A door panel is thin THROUGH the opening and wide ACROSS it. The panel's thin
+> horizontal axis is the swing direction; the wide one is the threshold.
+
+**The whole-NIF bounding box cannot answer this** — it includes the door
+frame/arch, which routinely dwarfs the panel and inverts the result:
+
+| model | bbox | panel | old (bbox) | correct |
+|---|---|---|---|---|
+| `AnvilDoorMC01` | 98 × 150 | 97.9 × 4.5 | Y | **X** |
+| `chorrolfightersguildinteriordoorjam` | 188 × 32 | 34.5 × 186.5 | X | **Y** |
+| `icbarreddoor01` | 152 × 14 | 15.2 × 136.8 | X | **Y** |
+
+22 of 184 door models were wrong under the bbox rule, each laying its door quad
+90° out (Anvil's exterior doors — Pinarus's house among them).
+
+Read the **`output/`** meshes, not `export/`: the shipped collision is what the
+navmesh and engine use, and its body transform is already baked into the shape,
+so there is no `bhkRigidBodyT`-vs-`bhkRigidBody` rotation branch to get wrong.
+
+The same measurement supplies the doorway **WIDTH**, and the quad must span it.
+Door panels run **16u to 764u wide (median 121)**, so the old hardcoded
+`DOOR_LINE_HALF = 45` (a 90u base line) was simply the wrong size for most
+doors. On `impdundoor01` (115u) it left the **first 30u of the threshold with
+no mesh under it**, and the Door Triangle came out a 571-unit scrap — smaller
+than *every one* of 1,659 vanilla door triangles (min 992, median 9,614) and too
+narrow for an actor to stand on. That is what stopped the CharacterGen assassins
+dead at their cell door: they reached the door triangle and could not settle onto
+it, so `OnPackageEnd` never fired, stage 23 never ran, and the other three
+assassins never got a valid package at all.
+
+Three traps, all of which silently dropped real doors:
+* **CMS must be unwrapped.** Converted doors ship `bhkMoppBvTreeShape` →
+  `bhkCompressedMeshShape`; 85 vanilla models (every Cheydinhal/Bravil/Leyawiin
+  and castle-tower door) arrive that way. Decode with `asset_convert.cms.decode_cms`.
+* **A zero-thickness collision sheet is legal.** `cathedraldoor02`,
+  `priorydoor01`, `weynondoor01`, `skdoormiddle01`, `icwalldoor01` ship a flat
+  plane where the ZERO axis *is* the swing direction. Rejecting `min(ex,ey)==0`
+  dropped 10 real doors.
+* **Thin-in-Z means no threshold at all.** Trapdoors, hatches, grates, manhole
+  covers and display cases swing about a HORIZONTAL axis. They get no quad
+  (`_DOOR_NO_THRESHOLD`); assigning one lays a quad across the floor in an
+  arbitrary direction. Teleport doors are kept regardless — they still link two
+  navmeshes.
+
+#### 🔴 An unreadable door shape is NOT a trapdoor
+
+`_DOOR_NO_THRESHOLD` (thin-in-Z) must only suppress the door QUAD — never the
+door itself. Dropping such doors from `_collect_doors` deleted the Imperial
+Prison cell gates, **including the player's own starting cell door**, because
+`bhkListShape` (the gates ship as a list of bars) read as "no shape" and is
+indistinguishable from a real trapdoor once it reaches the cache. Every door
+must still receive a Door Triangle or the doorway is dead in the engine.
+
+Collision shapes that must be unwrapped before measuring: `bhkMoppBvTreeShape`
+and `bhkConvexTransformShape` (single child), `bhkListShape` (**several**
+children).
+
+#### 🔴 The debug tools were measuring doors the pipeline never builds
+
+`navmesh_audit.py` cached `door_fids` as a **set**, while the pipeline
+(`import_main._build_door_fid_set`) builds a **fid → model-key map**. With a set,
+`_collect_doors` takes its legacy membership-only path: no panel centring, no
+threshold axis, **width 0**. `navmesh_cell_check.py` additionally never called
+`load_door_centroids` at all. So every generated-cell tool silently graded doors
+with the default orientation and no width — the exact opposite of what shipped.
+If a door metric from a debug tool disagrees with the ESM, check this first.
+`navmesh_probe.py` (and therefore `navmesh_preview.py`) always loaded it.
+
+### Drop-downs are EDGE LINKS, not bridging triangles
+
+Oblivion expresses a drop-down as two disconnected pathgrid islands — the actor
+steps off a ledge and there is no pathgrid edge for it. Skyrim's own mechanism
+is an NVNM **Edge Link**, typed by `wbNavmeshEdgeLinkEnum`
+(`xEdit/Core/wbDefinitionsCommon.pas:7272`):
+
+| Type | Meaning |
+|---|---|
+| 0 | Portal (ordinary cross-mesh connection) |
+| 1 | **Ledge Up** |
+| 2 | **Ledge Down** |
+| 3 | Enable/Disable Portal |
+
+A drop-down is a **pair**: `Ledge Down` on the upper triangle, `Ledge Up` on the
+lower. Vanilla census (Skyrim.esm, 3,000 navmeshes): 30,546 Portal, **467 Ledge
+Up, 476 Ledge Down** — near-symmetric, exactly as pairing implies. Both links
+may name the SAME navmesh when both triangles are in it (`0008FFE1` links to
+itself), which is the usual case for us.
+
+The linked triangle must also set the matching **per-edge link bit** in its
+flags — `0x0001`/`0x0002`/`0x0004` for edge slot 0/1/2 (vanilla shows `0x0801`,
+`0x0802`, `0x0804`). Pick the slot that is an OPEN edge (no neighbour) facing
+the other side: that is the lip.
+
+`corridor_clean.find_ledge_links` detects the pairs and `pgrd_to_navm._pack_nvnm`
+writes them. It previously **stitched two triangles across the lip** instead,
+which is wrong twice over: actors walk on air across the gap, and the near-
+vertical quad breeds downfacing/opposite-normal triangles (ImperialDungeon01:
+DOWNFACING 4 → 2 once the bridging was removed).
+
+Triangles are identified by CENTROID between detection and packing — the cull
+and compaction passes reorder both triangles and vertices, so an index captured
+early is meaningless later.
+
+### 🔴 The Door Triangle is RESERVED, not protected
+
+Vanilla marks a door with **ONE** triangle whose long edge is the **full width
+of the doorway**. The way to guarantee that is not to defend the triangle from
+the passes that would damage it — it is to make sure they never see it:
+
+1. `corridor_union._triangulate` computes the door triangle (base line +
+   apex) and **cuts it out of the polygon** with `difference()` before
+   Delaunay runs. The triangulator fills around a hole and cannot subdivide
+   what is not there.
+2. Every pass afterwards — the 3D weld, the T-junction split, the
+   pathgrid-node merge, make-manifold, decimation, the island cull — sees the
+   doorway as ordinary mesh boundary. Nothing there to split, weld or drop.
+3. `corridor.build_corridors` calls `corridor_union.attach_door_triangles`
+   **last**, after `finalize`, snapping the base endpoints tightly
+   (`ATTACH_R_BASE = 2`) so the door line keeps its exact width and the apex
+   loosely (`ATTACH_R_APEX = 8`) so it shares real edges with the mesh.
+
+**Do not add per-pass protection instead.** That was tried across
+`_weld_sheets`, `_split_t_junctions`, `_merge_at_pathgrid_nodes` and
+`_make_manifold`; survival went 13/27 → 17/28 → 19/28 and never reached the
+guarantee. Reservation reached **28/28 on the first try**, and every protective
+branch was deleted afterwards.
+
+Three rules the reservation itself must obey:
+
+* **Never cut a hole that DISCONNECTS the sheet.** Where a door sits in a
+  narrow passage the wedge can span the whole corridor: ImperialDungeon01's
+  main surface stopped at x=2170 instead of 2293 and the door triangle became a
+  lone island. Compare polygon part-counts before/after each `difference()` and
+  skip any cut that raises it. A door triangle is worth nothing if it costs the
+  corridor it serves.
+* **Skip a triangle with nothing to attach to.** If all three corners mint new
+  vertices, the pathgrid never reached that door; the triangle would land as an
+  unreachable scrap.
+* **Dedupe per STOREY, not per XY.** Two sheets bordering one threshold each
+  reserve it (drop one), but the same door line at a different height is a
+  different floor's doorway and keeps its own triangle (ChorrolCastleWallTowerSW
+  has one at z=526 and one at z=-15).
+
+Measured over 40 interior cells: 72 doorways, **every one with exactly one
+full-width triangle**, none missing.
+
 ### Door threshold quads (Door Triangles done right)
 
 `spanmesh._stamp_door_quads`: every door REFR (teleport AND interior) gets an

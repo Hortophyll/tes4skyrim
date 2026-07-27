@@ -482,7 +482,8 @@ def build_corridors(refr_recs, base_model_by_fid, get_collision, nodes, edges,
                     land_rec=None, origin_x=0.0, origin_y=0.0, doors=None):
     """Phase-1 corridor navmesh for one cell.  Returns (verts, tris) lists.
 
-    doors: [(x, y, z, rot_z, is_teleport), ...] pivot-corrected door centres.
+    doors: [(x, y, z, rot_z, is_teleport, width), ...] pivot-corrected door
+        centres; width is the measured doorway span in world units.
     """
     if not nodes or not edges:
         return [], []
@@ -560,7 +561,7 @@ def build_corridors(refr_recs, base_model_by_fid, get_collision, nodes, edges,
     # wall crossings, not fewer).  Per-storey handling is needed instead.
     wall_cut = None
 
-    door_list = [(x, y, z, r, tp) for (x, y, z, r, tp) in (doors or ())]
+    door_list = [(x, y, z, r, tp, w) for (x, y, z, r, tp, w) in (doors or ())]
     door_strips = []
     door_edges = []
     if door_list:
@@ -569,7 +570,8 @@ def build_corridors(refr_recs, base_model_by_fid, get_collision, nodes, edges,
                                                  wall_cut=wall_cut)
         if rt:
             for fp in corridor_doors.door_footprints(rv, rt, door_list,
-                                                     wall_hit=wall_hit):
+                                                     wall_hit=wall_hit,
+                                                     nodes=nodes):
                 door_strips.append(corridor_union._poly_strip(fp['poly'],
                                                               fp['z']))
                 door_edges.append(fp['base'])
@@ -585,7 +587,7 @@ def build_corridors(refr_recs, base_model_by_fid, get_collision, nodes, edges,
     # reach another cell — via a door, or (exterior) by touching the cell
     # border where a worldspace edge-link continues it.  Pass the door centres
     # and, for an exterior cell, its world-space bounds.
-    door_xy = [(x, y, z) for (x, y, z, r, tp) in door_list]
+    door_xy = [(x, y, z) for (x, y, z, r, tp, w) in door_list]
     cell_bounds = None
     if land_rec is not None:
         cell_bounds = (origin_x, origin_y, origin_x + 4096.0, origin_y + 4096.0)
@@ -612,9 +614,23 @@ def build_corridors(refr_recs, base_model_by_fid, get_collision, nodes, edges,
                            nodes[i][1] + (nodes[j][1] - nodes[i][1]) * f,
                            node_z[i] + (node_z[j] - node_z[i]) * f))
 
-    verts, tris = corridor_clean.finalize(verts, tris, cs=cs,
-                                          doors=door_xy, cell_bounds=cell_bounds,
-                                          pin_xy=pin_xy)
+    verts, tris, ledges = corridor_clean.finalize(
+        verts, tris, cs=cs, doors=door_xy, cell_bounds=cell_bounds,
+        pin_xy=pin_xy)
 
-    return ([tuple(float(c) for c in v) for v in verts],
-            [tuple(int(i) for i in t) for t in tris])
+    verts = [tuple(float(c) for c in v) for v in verts]
+    tris = [tuple(int(i) for i in t) for t in tris]
+
+    # ADD THE DOOR TRIANGLES BACK, LAST.  They were cut out of the polygon
+    # before triangulation, so every pass above -- Delaunay, the 3D weld, the
+    # T-junction split, the pathgrid-node merge, make-manifold, the island cull
+    # -- saw the doorway as plain mesh boundary and had nothing there to split,
+    # weld or drop.  Adding them only now is what makes "one triangle per door,
+    # its long side the full width of the doorway" a guarantee rather than
+    # something the cleanup passes might survive.
+    if corridor_union.PENDING_DOOR_TRIS:
+        verts, tris = corridor_union.attach_door_triangles(
+            verts, tris, corridor_union.PENDING_DOOR_TRIS)
+
+    return (verts, tris,
+            [(int(a), int(b), float(d)) for (a, b, d) in ledges])

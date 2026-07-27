@@ -116,6 +116,12 @@ _TRI_FLAG_DOOR = 0x0400
 _TRI_FLAG_FOUND = 0x0800     # set on every vanilla generated triangle
 _TRI_EDGE_LINK = (0x0001, 0x0002, 0x0004)  # per-edge "has Edge Link" bits
 
+# NVNM Edge Link types (xEdit wbNavmeshEdgeLinkEnum).  A DROP-DOWN is a pair:
+# Ledge Down on the upper triangle, Ledge Up on the lower.
+_EDGE_LINK_PORTAL = 0
+_EDGE_LINK_LEDGE_UP = 1
+_EDGE_LINK_LEDGE_DOWN = 2
+
 # NavMeshGrid divisor is chosen per-navmesh from the bbox span so buckets stay
 # roughly one "grid cell" (~512u) wide, matching vanilla (divisor 3..12).
 GRID_TARGET_CELL = 600.0
@@ -245,6 +251,34 @@ def _build_navmesh_grid(verts, tris, min_x, min_y, max_x, max_y, divisor):
 # HINGE, not the opening; the panel midpoint is the point an actor walks
 # through, and where the Door Triangle belongs.
 _DOOR_CENTROIDS = {}
+# model key -> local z of the door mesh's BASE (its bbox z-min).  Added to the
+# REFR PosZ this gives the threshold's floor height; see load_door_centroids.
+_DOOR_FLOOR_DZ = {}
+# model key -> True when the door's threshold runs along the mesh's LOCAL +Y
+# (the wider horizontal extent), False when it runs along local +X.  Read per
+# model in load_door_centroids; door meshes do not share one convention.
+_DOOR_THRESH_LOCAL_Y = {}
+# Models whose collision panel is thin in Z: trapdoors, hatches and display
+# cases.  They swing about a HORIZONTAL axis, so no vertical-axis threshold
+# line exists and they must not receive a door quad.
+_DOOR_NO_THRESHOLD = set()
+# model key -> real doorway WIDTH in world units, measured off the collision
+# panel.  Door panels range from 16u to 764u wide (median 121), so a single
+# hardcoded half-width cannot span them: at 90u it left the first 30u of
+# impdundoor01's 115u threshold with no mesh, shrinking the Door Triangle to a
+# 571-unit scrap that actors could not stand on.
+_DOOR_WIDTH = {}
+
+
+def door_threshold_axis(model_key):
+    """Unit local-space direction the door's threshold line runs along.
+
+    Returns (x, y) in the door mesh's LOCAL frame; the caller rotates it by the
+    REFR's RotZ.  Defaults to local +Y, which is the more common door layout.
+    """
+    if _DOOR_THRESH_LOCAL_Y.get(model_key, True):
+        return (0.0, 1.0)
+    return (1.0, 0.0)
 
 
 def load_door_centroids(cache_path, quiet: bool = False) -> int:
@@ -264,6 +298,63 @@ def load_door_centroids(cache_path, quiet: bool = False) -> int:
             raw = json.load(fh)
         for k, v in raw.items():
             _DOOR_CENTROIDS[k] = (float(v[0]), float(v[1]))
+        # The REFR pivot sits at the door mesh's local z=0, which for a door is
+        # up at the HINGE, not on the floor: impdundoor01's panel runs local z
+        # -140.8..+57.7, so PosZ is ~141u above the threshold it stands on.
+        # The door-quad Z gate (DOOR_QUAD_ZTOL, 128) then rejected every
+        # corridor edge at the real floor height and the door produced NO
+        # footprint at all -- measured on CharacterGen's Ambush A doors, off by
+        # 140.8 and 144.0.  The mesh-bounds cache already carries each model's
+        # local z-min, so read it from there rather than duplicating it here.
+        _DOOR_FLOOR_DZ.clear()
+        bpath = os.path.join(os.path.dirname(cache_path),
+                             'mesh_bounds_cache.json')
+        if os.path.exists(bpath):
+            try:
+                with open(bpath, encoding='utf-8') as fh:
+                    bounds = json.load(fh)
+                for k in _DOOR_CENTROIDS:
+                    b = bounds.get(k)
+                    if not b or len(b) < 6:
+                        continue
+                    _DOOR_FLOOR_DZ[k] = float(b[2])
+            except (OSError, ValueError):
+                pass
+        # Which LOCAL axis the threshold runs along, read from the door's
+        # COLLISION PANEL (asset_convert.collision_extract).  The whole-NIF
+        # bounding box cannot answer this: it includes the door FRAME/arch,
+        # which dwarfs the panel and inverts the result -- AnvilDoorMC01's bbox
+        # is 98 x 150 ("Y wider" -> threshold Y) while its panel is 97.9 x 4.5
+        # -> threshold X.  Nine door models were wrong that way, each placing
+        # its navmesh door quad 90 degrees out (Anvil's exterior doors among
+        # them).  Doors absent from the cache are trapdoors/hatches (they swing
+        # about a horizontal axis and get no threshold) or have no collision.
+        _DOOR_THRESH_LOCAL_Y.clear()
+        _DOOR_NO_THRESHOLD.clear()
+        apath = os.path.join(os.path.dirname(cache_path),
+                             'door_panel_axis_cache.json')
+        if os.path.exists(apath):
+            try:
+                with open(apath, encoding='utf-8') as fh:
+                    axes = json.load(fh)
+                for k in _DOOR_CENTROIDS:
+                    a = axes.get(k)
+                    if a is None:
+                        # Absent means "thin in Z" (a real trapdoor) OR "we
+                        # could not read the collision".  Only the former may
+                        # lose its door marker, and the cache cannot tell them
+                        # apart, so nothing is dropped here — see the
+                        # _DOOR_NO_THRESHOLD note in _collect_doors.
+                        _DOOR_NO_THRESHOLD.add(k)
+                        continue
+                    if isinstance(a, str):          # axis-only cache
+                        _DOOR_THRESH_LOCAL_Y[k] = (a == 'Y')
+                        continue
+                    _DOOR_THRESH_LOCAL_Y[k] = (a[0] == 'Y')
+                    if len(a) > 1 and a[1]:
+                        _DOOR_WIDTH[k] = float(a[1])
+            except (OSError, ValueError):
+                pass
         if not quiet:
             print(f"  Door centres: loaded {len(_DOOR_CENTROIDS)} entries")
         return len(_DOOR_CENTROIDS)
@@ -293,11 +384,14 @@ def _door_threshold(refr, model_key):
     lx, ly = c[0] * scale, c[1] * scale
     wx = get_float(refr, 'PosX') + (lx * cosz - ly * sinz)
     wy = get_float(refr, 'PosY') + (lx * sinz + ly * cosz)
-    return (wx, wy, get_float(refr, 'PosZ'))
+    # Drop z from the pivot (the hinge, up the door leaf) to the panel's base,
+    # so the door sits on the storey it actually opens onto.
+    wz = get_float(refr, 'PosZ') + _DOOR_FLOOR_DZ.get(model_key, 0.0) * scale
+    return (wx, wy, wz)
 
 
 def _collect_doors(refr_recs, door_fids):
-    """Return [(x, y, z, rot_z, ref_fid, is_teleport), ...] for door refs.
+    """Return [(x, y, z, rot_z, ref_fid, is_teleport, width), ...] for doors.
 
     A door is a REFR whose base is a DOOR (in door_fids) or that has an XTEL
     teleport. is_teleport distinguishes cross-cell doors (XTEL — link two
@@ -330,8 +424,26 @@ def _collect_doors(refr_recs, door_fids):
         if pt is None:
             pt = (get_float(refr, 'PosX'), get_float(refr, 'PosY'),
                   get_float(refr, 'PosZ'))
-        out.append((pt[0], pt[1], pt[2], get_float(refr, 'RotZ'),
-                    ref_fid, is_teleport))
+        # Normalise the rotation so that, for EVERY door, local +Y is the
+        # threshold direction.  Door meshes disagree about which local axis is
+        # the wide one (impdundoor01 is wide in Y, icdoorint01 wide in X), so a
+        # single convention downstream rotated some doors 90 degrees.  Adding a
+        # quarter turn for the X-wide meshes lets every consumer -- the door
+        # quad and navmesh_preview alike -- use one rule.
+        rz = get_float(refr, 'RotZ')
+        mk = door_fids.get(base) if is_map else None
+        # A trapdoor/hatch has no vertical-axis threshold, so it gets NO QUAD
+        # (width 0 below).  It is still emitted: _build_door_links must give
+        # every door a Door Triangle or the doorway goes dead in the engine.
+        # Dropping them here deleted the Imperial Prison cell gates — the
+        # player's own starting cell door among them — because a shape the
+        # extractor could not read (bhkListShape) is indistinguishable from a
+        # real trapdoor in the cache.
+        if mk is not None and not _DOOR_THRESH_LOCAL_Y.get(mk, True):
+            rz += math.pi * 0.5
+        scale = get_float(refr, 'XSCL.Scale', 1.0) or 1.0
+        width = _DOOR_WIDTH.get(mk, 0.0) * scale if mk is not None else 0.0
+        out.append((pt[0], pt[1], pt[2], rz, ref_fid, is_teleport, width))
     return out
 
 
@@ -356,8 +468,19 @@ def _build_door_links(verts, tris, doors):
                       (verts[a][1] + verts[b][1] + verts[c][1]) / 3.0))
 
     def _containing(dx, dy, dz):
-        """Triangle containing (dx,dy) nearest dz, or None."""
-        best = None            # (|dz|, ti)
+        """Triangle containing (dx,dy) nearest dz, or None.
+
+        The door point lies ON the threshold, which after constraint recovery is
+        a shared triangle EDGE — so two or more triangles legitimately contain
+        it and the choice is a tie.  Breaking that tie by triangle INDEX picked
+        an arbitrary one: on the CharacterGen assassins' cell door the same
+        geometry yielded either a 1,586-unit triangle or a 572-unit sliver
+        depending only on iteration order, and the sliver is too narrow for an
+        actor to stand on (vanilla door triangles: min 992, median 9,614).
+        Prefer the LARGEST containing triangle, which is both standable and
+        deterministic.
+        """
+        best = None            # (|dz|, -area, ti)
         for ti, (a, b, c) in enumerate(tris):
             if ti in used_tris:
                 continue
@@ -375,13 +498,17 @@ def _build_door_links(verts, tris, doors):
                 continue
             z = l0 * va[2] + l1 * vb[2] + l2 * vc[2]
             dzz = abs(z - dz)
-            if dzz <= 128.0 and (best is None or dzz < best[0]):
-                best = (dzz, ti)
+            area = 0.5 * abs(d)
+            # Heights within a step are "the same floor": rank those by AREA so
+            # a sliver never wins over the real door triangle beside it.
+            key = (round(dzz / 32.0), -area, ti)
+            if dzz <= 128.0 and (best is None or key < best[0]):
+                best = (key, ti)
         return best[1] if best else None
 
     used_tris = set()
     links = []
-    for (dx, dy, dz, rot_z, ref_fid, _is_tp) in doors:
+    for (dx, dy, dz, rot_z, ref_fid, _is_tp, _w) in doors:
         if not ref_fid:
             continue
         best_ti = _containing(dx, dy, dz)
@@ -433,15 +560,47 @@ def _choose_divisor(span_x, span_y):
     return max(GRID_DIVISOR_MIN, min(GRID_DIVISOR_MAX, g))
 
 
+def _open_edge_towards(verts, tris, adj, ti, other_ti):
+    """Slot (0..2) of ti's border edge facing triangle other_ti, or None.
+
+    A drop-down is stepped off an OPEN edge — one with no neighbour, i.e. the
+    lip.  Of those, the one whose midpoint is closest to the other side is the
+    edge the actor actually uses.
+    """
+    tri = tris[ti]
+    ox = sum(verts[i][0] for i in tris[other_ti]) / 3.0
+    oy = sum(verts[i][1] for i in tris[other_ti]) / 3.0
+    best = None
+    for slot in range(3):
+        if adj[ti][slot] >= 0:
+            continue                    # has a neighbour: not a lip
+        a = verts[tri[slot]]
+        b = verts[tri[(slot + 1) % 3]]
+        mx, my = 0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1])
+        d = (mx - ox) ** 2 + (my - oy) ** 2
+        if best is None or d < best[0]:
+            best = (d, slot)
+    return best[1] if best else None
+
+
 def _pack_nvnm(verts, tris, adj, tri_flags,
                wrld_fid, cell_fid, grid_x, grid_y, is_exterior,
-               door_tris=None) -> bytes:
+               door_tris=None, ledges=None, navm_fid=0) -> bytes:
     """Serialise an NVNM blob.
 
     door_tris: list of (triangle_index, door_ref_fid) — emitted as Door
     Triangles and flagged with _TRI_FLAG_DOOR on the referenced triangle.
+
+    ledges: list of (upper_tri, lower_tri, drop) — DROP-DOWNs between
+    disconnected storeys, emitted as Edge Links of type Ledge Down (2) on the
+    upper triangle and Ledge Up (1) on the lower.  This is Skyrim's own
+    mechanism for stepping off a ledge (vanilla Skyrim.esm: 476 Ledge Down /
+    467 Ledge Up across 3,000 navmeshes); bridging the gap with triangles
+    instead makes actors walk on air across the lip.  Both links name THIS
+    navmesh (navm_fid), since both triangles are in it.
     """
     door_tris = door_tris or []
+    ledges = ledges or []
     door_by_tri = {ti: fid for (ti, fid) in door_tris}
 
     buf = bytearray()
@@ -458,8 +617,24 @@ def _pack_nvnm(verts, tris, adj, tri_flags,
     for x, y, z in verts:
         buf += struct.pack('<fff', x, y, z)
 
+    # Ledge links: pick, on each linked triangle, the edge that has no
+    # neighbour and faces the other side — that is the lip the actor steps
+    # off.  Vanilla marks it with the per-edge link bit (0x0801/2/4).
+    link_bit = {}                       # tri -> edge-link flag bits
+    edge_links = []                     # (type, navm_fid, triangle)
+    for (hi, lo, _drop) in ledges:
+        if not (0 <= hi < len(tris) and 0 <= lo < len(tris)):
+            continue
+        for (ti, other, typ) in ((hi, lo, _EDGE_LINK_LEDGE_DOWN),
+                                 (lo, hi, _EDGE_LINK_LEDGE_UP)):
+            slot = _open_edge_towards(verts, tris, adj, ti, other)
+            if slot is None:
+                continue
+            link_bit[ti] = link_bit.get(ti, 0) | _TRI_EDGE_LINK[slot]
+            edge_links.append((typ, navm_fid, ti))
+
     # Triangles — base "Found" flag on every tri (matches vanilla), plus water
-    # / door bits. No per-edge link bits: we emit no Edge Links.
+    # / door / edge-link bits.
     buf += struct.pack('<I', len(tris))
     for ti, (v0, v1, v2) in enumerate(tris):
         e01, e12, e20 = adj[ti]
@@ -467,10 +642,16 @@ def _pack_nvnm(verts, tris, adj, tri_flags,
         flags |= (tri_flags[ti] if ti < len(tri_flags) else 0)
         if ti in door_by_tri:
             flags |= _TRI_FLAG_DOOR
+        flags |= link_bit.get(ti, 0)
         buf += struct.pack('<6h2H', v0, v1, v2, e01, e12, e20, flags, 0)
 
-    # Edge Links — none (cross-cell links can't be resolved from PGRD alone).
-    buf += struct.pack('<I', 0)
+    # Edge Links.  Cross-cell portals are added later by build_edge_links;
+    # what we can resolve from the PGRD alone is the DROP-DOWN pair, which is
+    # a link within THIS navmesh (vanilla does the same — 0008FFE1 links to
+    # itself).
+    buf += struct.pack('<I', len(edge_links))
+    for (typ, nav, ti) in edge_links:
+        buf += struct.pack('<IIh', typ, nav, ti)
 
     # Door Triangles: sorted by (triangle, door) per xEdit wbStructSK([0,2]).
     sorted_doors = sorted(door_tris, key=lambda d: (d[0], d[1]))
@@ -544,6 +725,10 @@ def _geom_hash(tag, points, edges, refr_recs, base_model_by_fid, doors,
                land_rec, origin_x, origin_y):
     """Hash of everything the geometry build consumes."""
     h = hashlib.sha1()
+    # Bump when the CACHED PAYLOAD's shape changes, not just its inputs: the
+    # entry now carries ledge links too, and an older entry would silently
+    # restore geometry with no drop-downs.
+    h.update(b'geom-v2-ledges')
     h.update(repr((tag, origin_x, origin_y)).encode())
     h.update(repr(points).encode())
     h.update(repr(edges).encode())
@@ -559,8 +744,10 @@ def _geom_hash(tag, points, edges, refr_recs, base_model_by_fid, doors,
             refr.get('PosX'), refr.get('PosY'), refr.get('PosZ'),
             refr.get('RotX'), refr.get('RotY'), refr.get('RotZ'),
             refr.get('XSCL.Scale'), bool(refr.get('XTEL.Door')))).encode())
-    for (x, y, z, r, _fid, tp) in doors or ():
-        h.update(repr((x, y, z, r, tp)).encode())
+    for (x, y, z, r, _fid, tp, w) in doors or ():
+        # Width participates: it sizes the door quad, so a changed panel
+        # measurement must invalidate the cached geometry.
+        h.update(repr((x, y, z, r, tp, w)).encode())
     if land_rec is not None:
         h.update((get_str(land_rec, 'VHGT') or '').encode())
     return h.hexdigest()
@@ -575,19 +762,21 @@ def _geom_cache_load(path, want_hash):
             return None
         verts = [tuple(v) for v in stored['verts'].tolist()]
         tris = [tuple(t) for t in stored['tris'].tolist()]
-        return verts, tris
+        ledges = [tuple(l) for l in stored.get('ledges', ())]
+        return verts, tris, ledges
     except Exception:
         return None
 
 
-def _geom_cache_store(path, geom_hash, verts, tris):
+def _geom_cache_store(path, geom_hash, verts, tris, ledges=()):
     import numpy as np
     try:
         tmp = path + '.tmp%d' % os.getpid()
         with open(tmp, 'wb') as fh:
             pickle.dump({'hash': geom_hash,
                          'verts': np.asarray(verts, dtype=np.float32),
-                         'tris': np.asarray(tris, dtype=np.int32)},
+                         'tris': np.asarray(tris, dtype=np.int32),
+                         'ledges': [tuple(l) for l in (ledges or ())]},
                         fh, pickle.HIGHEST_PROTOCOL)
         os.replace(tmp, path)
     except Exception:
@@ -761,19 +950,22 @@ def convert_PGRD(rec: dict, writer=None,
             cache_dir, '%08X_%08X.pkl' % (cell_fid, get_formid(rec, 'FormID')))
         cached = _geom_cache_load(cache_path, geom_hash)
         if cached is not None:
-            verts3d, tris = cached
+            verts3d, tris, ledges = cached
             geom_cached = True
 
     if verts3d is None:
         from .navmesh import build as navmesh_build
         from asset_convert.collision_extract import get_collision
 
+        ledges = []
         verts3d, tris = navmesh_build.build_navmesh(
             refr_recs or [], base_model_by_fid or {}, get_collision,
             points, edges,
             land_rec=land_rec if is_exterior else None,
             origin_x=origin_x, origin_y=origin_y,
-            doors=[(x, y, z, r, tp) for (x, y, z, r, _f, tp) in doors])
+            doors=[(x, y, z, r, tp, w)
+                   for (x, y, z, r, _f, tp, w) in doors],
+            ledges_out=ledges)
         if verts3d:
             # Round to float32 NOW so a fresh build and a cache hit (stored as
             # float32) produce byte-identical NVNMs — NVNM packs f32 anyway.
@@ -781,7 +973,7 @@ def convert_PGRD(rec: dict, writer=None,
             verts3d = [tuple(v) for v in
                        np.asarray(verts3d, dtype=np.float32).tolist()]
         if cache_path is not None:
-            _geom_cache_store(cache_path, geom_hash, verts3d, tris)
+            _geom_cache_store(cache_path, geom_hash, verts3d, tris, ledges)
     if len(verts3d) < 3 or not tris:
         return None, None
 
@@ -792,12 +984,13 @@ def convert_PGRD(rec: dict, writer=None,
     # ---- Door triangles: link the navmesh tri at each door threshold ----
     door_tris = _build_door_links(verts3d, tris, doors)
 
-    nvnm = _pack_nvnm(verts3d, tris, adj, tri_flags,
-                      wrld_fid, cell_fid, grid_x, grid_y, is_exterior,
-                      door_tris=door_tris)
-
+    # The ledge links name THIS navmesh, so its FormID must exist first.
     if navm_fid is None:
         navm_fid = writer.alloc_formid()
+
+    nvnm = _pack_nvnm(verts3d, tris, adj, tri_flags,
+                      wrld_fid, cell_fid, grid_x, grid_y, is_exterior,
+                      door_tris=door_tris, ledges=ledges, navm_fid=navm_fid)
     subs = b''
     edid = get_str(rec, 'EditorID')
     if edid:

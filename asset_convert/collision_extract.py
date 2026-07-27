@@ -335,6 +335,158 @@ def bounds_from_data(data):
     )
 
 
+def _tri_shape_points(shape):
+    """Vertices of a bhk triangle-mesh collision shape, in shape space.
+
+    bhkPackedNiTriStripsShape keeps them in a shared hkPackedNiTriStripsData;
+    bhkNiTriStripsShape keeps a list of NiTriStripsData.  Both are scaled by the
+    shape's own `scale` where present.
+    """
+    pts = []
+    data = getattr(shape, 'data', None)
+    if data is not None and hasattr(data, 'vertices'):
+        for v in data.vertices:
+            pts.append((v.x, v.y, v.z))
+    for sd in (getattr(shape, 'strips_data', None) or ()):
+        if getattr(sd, 'has_vertices', True):
+            for v in sd.vertices:
+                pts.append((v.x, v.y, v.z))
+    if not pts:
+        return pts
+    # bhkPackedNiTriStripsShape stores vertices already in havok units; the
+    # per-shape scale (when it is a vector) applies on top.
+    sc = getattr(shape, 'scale', None)
+    if sc is not None and hasattr(sc, 'x'):
+        sx, sy, sz = sc.x or 1.0, sc.y or 1.0, sc.z or 1.0
+        if (sx, sy, sz) != (1.0, 1.0, 1.0):
+            pts = [(p[0] * sx, p[1] * sy, p[2] * sz) for p in pts]
+    return pts
+
+
+def _unwrap_shapes(shape, depth=0):
+    """Yield the leaf collision shapes inside wrappers and containers.
+
+    bhkMoppBvTreeShape / bhkConvexTransformShape wrap ONE shape; bhkListShape
+    holds SEVERAL (the prison cell gates ship as a list of bars).  A door whose
+    shape is a container yielded nothing before, which made it look like a
+    trapdoor and dropped the door entirely.
+    """
+    if shape is None or depth > 6:
+        return
+    name = type(shape).__name__
+    if name in ('bhkMoppBvTreeShape', 'bhkConvexTransformShape',
+                'bhkTransformShape'):
+        yield from _unwrap_shapes(getattr(shape, 'shape', None), depth + 1)
+        return
+    if name == 'bhkListShape':
+        for sub in (getattr(shape, 'sub_shapes', None) or ()):
+            yield from _unwrap_shapes(sub, depth + 1)
+        return
+    yield shape
+
+
+def _shape_points(shape):
+    """Vertices of one leaf collision shape, in shape space, or None."""
+    name = type(shape).__name__
+    if name == 'bhkBoxShape':
+        d = shape.dimensions
+        return [(sx * d.x, sy * d.y, sz * d.z)
+                for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)]
+    if name == 'bhkConvexVerticesShape':
+        return [(v.x, v.y, v.z) for v in shape.vertices] or None
+    if name in ('bhkNiTriStripsShape', 'bhkPackedNiTriStripsShape'):
+        return _tri_shape_points(shape) or None
+    if name == 'bhkCompressedMeshShape':
+        # The converted doors ship CMS (Skyrim's format) -- 85 vanilla door
+        # models arrive here, including every Cheydinhal/Bravil/Leyawiin and
+        # castle-tower door.  Reuse the existing decoder.
+        cms_data = getattr(shape, 'data', None)
+        if cms_data is None:
+            return None
+        try:
+            from .cms import decode_cms
+            return [v for _key, tri in decode_cms(cms_data) for v in tri] or None
+        except Exception:
+            return None
+    return None
+
+
+def door_panel_axis_from_data(data):
+    """Door threshold as ('X'|'Y', width_in_havok_units), or None.
+
+    A door panel is, by definition, THIN through the opening and WIDE across it,
+    so the swing direction is the panel's thin horizontal axis and the threshold
+    is the wide one.  This reads the bhkRigidBody COLLISION shape -- the body the
+    engine actually collides with -- rather than the whole-NIF bounding box.
+
+    The bounding box is not usable here: it includes the door FRAME/arch, which
+    routinely dwarfs the panel and inverts the answer.  Measured on the shipped
+    meshes, AnvilDoorMC01's bbox is 98 x 150 (so "Y is wider" -> threshold Y),
+    while its panel is 97.9 x 4.5 -> threshold X.  22 of 184 door models
+    disagreed that way, each placing its navmesh door quad 90 degrees out.
+
+    Returns None ONLY when the panel is thin in Z -- a TRAPDOOR/hatch/display
+    case, which swings about a HORIZONTAL axis and has no vertical threshold.
+    A door whose collision cannot be read returns the ('X'|'Y', 0.0) fallback
+    instead: an unreadable shape is not evidence of a trapdoor, and dropping
+    those silently deleted the Imperial Prison cell gates -- including the
+    player's own starting cell door.
+    """
+    best = None
+    for block in data.blocks:
+        if 'bhkRigidBody' not in type(block).__name__:
+            continue
+        for sub in _unwrap_shapes(getattr(block, 'shape', None)):
+            pts = _shape_points(sub)
+            if not pts:
+                continue
+            # The converted meshes bake the body transform into the shape, so
+            # the rotation is normally identity; apply it when it is not, so
+            # this also reads correctly if handed an unbaked mesh.
+            rot = getattr(block, 'rotation', None)
+            if rot is not None and abs(rot.w - 1.0) > 1e-6:
+                w, x, y, z = rot.w, rot.x, rot.y, rot.z
+                out = []
+                for (vx, vy, vz) in pts:
+                    tx = 2.0 * (y * vz - z * vy)
+                    ty = 2.0 * (z * vx - x * vz)
+                    tz = 2.0 * (x * vy - y * vx)
+                    out.append((vx + w * tx + (y * tz - z * ty),
+                                vy + w * ty + (z * tx - x * tz),
+                                vz + w * tz + (x * ty - y * tx)))
+                pts = out
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            zs = [p[2] for p in pts]
+            ext = (max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs))
+            # Largest footprint wins when a mesh carries several bodies (double
+            # doors ship one body per leaf; either leaf gives the same axis).
+            if best is None or ext[0] * ext[1] > best[0] * best[1]:
+                best = ext
+    if best is None:
+        return None
+    ex, ey, ez = best
+    if max(ex, ey) <= 1e-9:
+        return None
+    # Thin in Z => swings about a HORIZONTAL axis (trapdoor, hatch, grate,
+    # display case, manhole cover).  No vertical-axis threshold line exists, so
+    # the caller must skip it rather than lay a door quad in a made-up
+    # direction.
+    if ez < max(ex, ey) * 0.5:
+        return None
+    # A zero-thickness collision sheet is legal and common: several vanilla
+    # doors (cathedraldoor02, priorydoor01, weynondoor01, skdoormiddle01,
+    # icwalldoor01) ship a flat plane, where the ZERO axis is exactly the swing
+    # direction.  Treating that as "unusable" dropped 10 real doors.
+    #
+    # The WIDTH is returned with the axis: the navmesh door quad must span the
+    # real doorway, and door panels are nowhere near a single size (16u to 764u,
+    # median 121).  A hardcoded half-width laid a 90u quad across
+    # impdundoor01's 115u threshold, leaving the first 30u of the doorway with
+    # no mesh at all and shrinking the Door Triangle to a 571-unit scrap.
+    return ('Y' if ey > ex else 'X'), max(ex, ey)
+
+
 def _worker(args: tuple):
     """Collision only (kept for `python -m asset_convert.collision_extract`)."""
     nif_path, rel_key = args
@@ -355,7 +507,7 @@ def _worker_both(args: tuple):
     try:
         data = read_nif_data(nif_path)
     except Exception:
-        return rel_key, None, None
+        return rel_key, None, None, None
     try:
         bounds = bounds_from_data(data)
     except Exception:
@@ -364,7 +516,11 @@ def _worker_both(args: tuple):
         col = collision_from_data(data)
     except Exception:
         col = None
-    return rel_key, bounds, col
+    try:
+        axis = door_panel_axis_from_data(data)
+    except Exception:
+        axis = None
+    return rel_key, bounds, col, axis
 
 
 # ---------------------------------------------------------------------------
@@ -480,14 +636,17 @@ def scan_mesh_data(mesh_dir: str, collision_cache: str, bounds_cache: str,
 
     col_results: Dict[str, dict] = {}
     bnd_results: Dict[str, tuple] = {}
+    axis_results: Dict[str, str] = {}
     with ProcessPoolExecutor(max_workers=workers) as ex:
         done = 0
-        for rel_key, bounds, col in ex.map(_worker_both, nif_files,
-                                           chunksize=16):
+        for rel_key, bounds, col, axis in ex.map(_worker_both, nif_files,
+                                                 chunksize=16):
             if col is not None:
                 col_results[rel_key] = col
             if bounds is not None:
                 bnd_results[rel_key] = bounds
+            if axis is not None:
+                axis_results[rel_key] = axis
             done += 1
             if done % 1000 == 0:
                 print(f"    {done}/{n} processed...")
@@ -506,6 +665,15 @@ def scan_mesh_data(mesh_dir: str, collision_cache: str, bounds_cache: str,
     os.makedirs(os.path.dirname(os.path.abspath(bounds_cache)), exist_ok=True)
     with open(bounds_cache, 'w', encoding='utf-8') as fh:
         json.dump({k: list(v) for k, v in bnd_results.items()}, fh)
+
+    # Door threshold axis, read from the COLLISION PANEL (see
+    # door_panel_axis_from_data).  Sits beside the bounds cache; pgrd_to_navm
+    # loads it to orient every door quad.
+    axis_path = os.path.join(os.path.dirname(os.path.abspath(bounds_cache)),
+                             'door_panel_axis_cache.json')
+    with open(axis_path, 'w', encoding='utf-8') as fh:
+        json.dump(axis_results, fh)
+    print(f"  Door panel axis: {len(axis_results)} doors classified")
 
     return len(col_results), len(bnd_results)
 
