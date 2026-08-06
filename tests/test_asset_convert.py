@@ -2962,6 +2962,81 @@ class TestAnimationBlockLayout:
         assert _BLEND_INTERP_FLAGS_ARRAYSIZE == 0x0201
 
 
+class TestKeyframedRequiresAnimation:
+    """A keyframed body implies the D_ANIMATED collision flags (137).
+
+    CLAUDE.md records the rule: "a keyframed body with anim flags on a
+    non-animated object flips the engine into the baked path and the whole
+    compound acts welded solid".  The held-trap work briefly shipped every
+    OL_TRAP (layer 14) mass-bearing body keyframed regardless of whether a
+    sequence drove it -- ctraplogs01 has 6 bodies of which only 1 is animated,
+    ctrapcavein01 has 24 of which 2 are not -- and Vilverin froze on cell load.
+
+    A non-animated body must stay on the static branch (ms=5, mass 0).  The
+    exception is a CONSTRAINED island (swinging maces): its links are held by
+    the constraint solver rather than a clip, and that path is in-game
+    confirmed.
+    """
+
+    @staticmethod
+    def _convert(rel):
+        import os
+        from asset_convert.pyffi_monkey_patch import apply_patches
+        apply_patches()
+        from pyffi.formats.nif import NifFormat
+        from asset_convert.collision import convert_all_collisions
+        src = os.path.join('export/Oblivion.esm/meshes', rel)
+        if not os.path.isfile(src):
+            pytest.skip('source mesh not exported: %s' % rel)
+        data = NifFormat.Data()
+        with open(src, 'rb') as fh:
+            data.read(fh)
+        root = data.roots[0]
+        convert_all_collisions(root, root)
+        return root
+
+    @staticmethod
+    def _bodies(root):
+        out = []
+        for blk in root.tree():
+            co = getattr(blk, 'collision_object', None)
+            body = getattr(co, 'body', None) if co is not None else None
+            if body is None or not hasattr(body, 'motion_system'):
+                continue
+            out.append((blk, co, body))
+        return out
+
+    def test_unanimated_trap_bodies_are_not_keyframed(self):
+        from asset_convert.collision import _node_is_animated
+        root = self._convert('dungeons/caves/traps/ctraplogs01.nif')
+        for blk, co, body in self._bodies(root):
+            if _node_is_animated(blk, root):
+                continue
+            assert body.motion_system != 4, 'non-animated body shipped keyframed'
+            assert co.flags != 137, 'non-animated body got D_ANIMATED flags'
+            assert body.mass == 0.0, 'non-animated body kept mass'
+
+    def test_animated_trap_body_still_holds_its_mass(self):
+        """The release needs a body Havok can actually move."""
+        from asset_convert.collision import _node_is_animated
+        root = self._convert('dungeons/caves/traps/ctraplogs01.nif')
+        animated = [(b, c, r) for b, c, r in self._bodies(root)
+                    if _node_is_animated(b, root)]
+        assert animated, 'expected at least one animated log'
+        for _blk, _co, body in animated:
+            assert body.motion_system == 4
+            assert body.mass > 0
+
+    def test_constrained_island_keeps_the_confirmed_behaviour(self):
+        """Swinging-mace links are held by the constraint solver, not a clip —
+        they keep mass even though no sequence drives them."""
+        root = self._convert('dungeons/caves/traps/ctrapswingmacelong01.nif')
+        massive = [r for _b, _c, r in self._bodies(root) if r.mass > 0]
+        assert len(massive) >= 6, 'chain links lost their mass'
+        for body in massive:
+            assert body.motion_system == 4
+
+
 class TestVoiceFilePrune:
     """A VTYP relocation empties the source-race folder: the run stops writing
     it, so a touched-dirs-only sweep can never reach the dead copies left

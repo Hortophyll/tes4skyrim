@@ -1867,7 +1867,11 @@ class ScriptConverter:
         # to run -- it is what stops the trap re-triggering).  The clip length
         # is not knowable here, so hand it to the polyfill, which waits out the
         # animation on its own thread and then destroys.
-        _playanim_re = re.compile(r'^(\s*)(.+?)\.PlayAnimation\("([^"]+)"\)\s*$')
+        # Tolerates the diagnostic form `Bool _tes4PlayedN = ref.PlayAnimation(...)`
+        # as well as a bare call, so the deferred-destroy rewrite below still
+        # recognises an animated target when trap tracing is emitted.
+        _playanim_re = re.compile(
+            r'^(\s*)(?:Bool\s+\w+\s*=\s*)?(.+?)\.PlayAnimation\("([^"]+)"\)\s*$')
         _setdestroyed_re = re.compile(
             r'^(\s*)(?:(.+?)\.)?SetDestroyed\(\s*(?:1|true)\s*\)\s*$',
             re.IGNORECASE)
@@ -6779,6 +6783,27 @@ class ScriptConverter:
                     else:
                         held = self.xref.script_owner_needs_havok_release(
                             self._current_script_edid)
+                # Trace the trap chain so one play session tells us whether the
+                # event fired, whether PlayAnimation reported success and
+                # whether the ref was still loaded -- the tripwire's break
+                # passes every static check, so the remaining question is
+                # runtime.  Scoped to scripts whose EditorID marks them as a
+                # trap/trigger, to keep the log readable.
+                _edid_low = (self._current_script_edid or '').lower()
+                if 'trap' in _edid_low or 'trig' in _edid_low:
+                    # Unique local per call: a block may hold several
+                    # playgroups (TG11cTrigPressurePlate01SCRIPT has 4) and
+                    # Papyrus rejects a redeclared local.
+                    self._trap_dbg_n = getattr(self, '_trap_dbg_n', 0) + 1
+                    var = f'_tes4Played{self._trap_dbg_n}'
+                    pre = f'  TES4Polyfill.TrapDebug({obj}, "pre-{seq}")\n'
+                    post = (f'\n  TES4Polyfill.TrapDebug({obj}, '
+                            f'"post-{seq} played=" + {var})')
+                    call = f'Bool {var} = {obj}.PlayAnimation("{seq}")'
+                    if held:
+                        return (pre + call + post + '\n'
+                                f'  TES4Polyfill.ReleaseBreakaway({obj})')
+                    return pre + call + post
                 if held:
                     return (f'{obj}.PlayAnimation("{seq}")\n'
                             f'  TES4Polyfill.ReleaseBreakaway({obj})')

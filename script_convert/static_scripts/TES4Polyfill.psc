@@ -553,23 +553,49 @@ EndFunction
 ;
 ; TES4 pairs `playgroup <grp>` with `setDestroyed 1` on the very next line
 ; (CTrigTripwire01SCRIPT, CTrapLogs01SCRIPT, CTrapCaveIn01SCRIPT,
-; MPlanksBreakAway01Script).  In Oblivion that was harmless: with no
-; destruction data on the record, setDestroyed only stopped the object being
-; activated again.  Oblivion ships ZERO DEST subrecords, so nothing we convert
-; has a destroyed state either -- but Skyrim's SetDestroyed still RESETS THE
-; REFERENCE'S 3D, and doing that one line after PlayAnimation tore down the
-; NiControllerSequence before a single frame of it had been drawn.  That is
-; what stopped the tripwire visibly snapping when it was walked over.
+; MPlanksBreakAway01Script).  Skyrim's SetDestroyed resets the reference's 3D,
+; so running it in the same frame as PlayAnimation risks tearing the sequence
+; down before it has drawn.  Waiting first keeps both halves of the original
+; intent: the clip plays out, and the object still ends up destroyed so it
+; cannot fire twice.  Same 1.0s budget as ReleaseBreakaway, chosen the same
+; way -- Papyrus cannot query a Gamebryo sequence's length.
 ;
-; Waiting first preserves both halves of the original intent: the break
-; animation plays to completion, and the object still ends up destroyed so it
-; cannot fire a second time.  Same 1.0s budget as ReleaseBreakaway, chosen the
-; same way -- Papyrus cannot query a Gamebryo sequence's length, and every
-; converted break clip but one outlier finishes well inside it.
+; NOTE: ordering alone is NOT what stops the tripwire snapping.  Vanilla's own
+; Tripwire.pex calls setDestroyed on TrapTripwire01, which has NO destruction
+; data either (0 DEST on that record; 610/1870 vanilla ACTI have one), so the
+; call is safe on a DEST-less record.  The tripwire's break is still unresolved
+; -- see the TES4TrapDebug logging below.
 Function DestroyAfterAnimation(ObjectReference akRef) Global
   If akRef == None
     Return
   EndIf
   Utility.Wait(1.0)
   akRef.SetDestroyed(true)
+EndFunction
+
+; Diagnostic for the trap/trigger chain (tripwire break, log detach).
+;
+; Every static check on ctrigtripwire01 passes: the Forward sequence keeps 5
+; controlled blocks, the morph emulation writes the NiVisController pair
+; (Rope:0 visible->hidden and Rope:0MrphRope01 hidden->visible at t=0.333),
+; the hidden target ships flags=15, all controllers carry Compute Scaled Time,
+; and the NiControllerManager binds the root exactly as the pressure plate's
+; does.  Structure matches vanilla sldjailwallcollapse01, the reference for a
+; vis-swap collapse.  Vanilla's own traptripwire01 is no help as a template --
+; it is a PHYSICS rope (bhkBallSocketConstraintChain, zero sequences), a
+; completely different design from Oblivion's morph-animated wire.
+;
+; So the next question is runtime, not file layout: does the event fire, does
+; PlayAnimation report success, and does the ref still exist when it runs.
+; This logs all three to `Papyrus.0.log` so one play session answers it.
+Function TrapDebug(ObjectReference akRef, String stage) Global
+  If akRef == None
+    Debug.Trace("TES4TrapDebug: " + stage + " ref=NONE")
+    Return
+  EndIf
+  Debug.Trace("TES4TrapDebug: " + stage \
+    + " ref=" + akRef \
+    + " base=" + akRef.GetBaseObject() \
+    + " loaded3D=" + akRef.Is3DLoaded() \
+    + " linked=" + akRef.GetLinkedRef())
 EndFunction

@@ -1662,6 +1662,13 @@ def _node_is_animated(node, actual_root):
 # props layer; nothing on layer 10 is expected to hold a pose against gravity.
 _OL_PROPS = 10
 
+# Oblivion collision layer 14 = OL_TRAP, the authored "this body is a moving
+# trap part" layer (ctraplogs01's logs, ctrapcavein01's rubble, the swing-blade
+# arms).  Same kind of statement of intent as OL_PROPS above: the artist picks
+# it in the exporter.  A mass-bearing ms=6 body on this layer is HELD until the
+# trap script releases it -- see _node_is_held_trap.
+_OL_TRAP = 14
+
 
 def _node_is_breakaway(node, actual_root, rb):
     """True if this animated node is a piece that breaks off and falls.
@@ -1678,6 +1685,24 @@ def _node_is_breakaway(node, actual_root, rb):
     for attr in ('havok_col_filter', 'havok_col_filter_copy'):
         hf = getattr(rb, attr, None)
         if hf is not None and int(getattr(hf, 'layer', -1)) == _OL_PROPS:
+            return True
+    return False
+
+
+def _island_has_constraint(node, actual_root, rb):
+    """True if this body, or anything in its NIF, owns a bhk constraint.
+
+    Island-wide because a chain link routinely carries mass with
+    num_constraints == 0 and hangs off a neighbour's constraint (same reason
+    collision_extract checks constraints file-wide).
+    """
+    if getattr(rb, 'num_constraints', 0) > 0:
+        return True
+    root = actual_root if actual_root is not None else node
+    for blk in root.tree():
+        co = getattr(blk, 'collision_object', None)
+        body = getattr(co, 'body', None) if co is not None else None
+        if body is not None and getattr(body, 'num_constraints', 0) > 0:
             return True
     return False
 
@@ -1700,16 +1725,23 @@ def _node_is_held_trap(node, actual_root, rb):
     Membership is island-wide, not per-body: a chain link routinely carries
     mass with num_constraints == 0 and hangs off a neighbour's constraint
     (the same reason collision_extract checks constraints file-wide).
+
+    A constraint is NOT required.  ctraplogs01's six logs are ms=6 + mass 20 on
+    layer 14 with NO constraints at all and only one of them animated, so the
+    constraint-only rule missed them entirely: five fell through to the static
+    branch, mass was zeroed, and the released logs could not roll no matter
+    what the script did ("activating the log trap plays an effect, but the logs
+    don't detach").  Layer 14 OL_TRAP is Oblivion's AUTHORED declaration that a
+    body is a moving trap part -- the artist picks it in the exporter, exactly
+    like OL_PROPS marks a breakaway piece (see _OL_PROPS above).  Census over
+    the 102 trap/trigger meshes in Oblivion.esm: 89 ms=6 mass-bearing bodies
+    sit on layer 14 with no constraint, the single largest group.
     """
-    if rb.num_constraints > 0:
-        return True
-    root = actual_root if actual_root is not None else node
-    for blk in root.tree():
-        co = getattr(blk, 'collision_object', None)
-        body = getattr(co, 'body', None) if co is not None else None
-        if body is not None and getattr(body, 'num_constraints', 0) > 0:
+    for attr in ('havok_col_filter', 'havok_col_filter_copy'):
+        hf = getattr(rb, attr, None)
+        if hf is not None and int(getattr(hf, 'layer', -1)) == _OL_TRAP:
             return True
-    return False
+    return _island_has_constraint(node, actual_root, rb)
 
 
 def _convert_blend_collision(node, coll_obj):
@@ -1894,12 +1926,30 @@ def _convert_collision(node, actual_root=None, keep_blend=False):
     #     SetMotionType(Motion_Dynamic) release start the swing.  Skyrim's own
     #     trapmace01 ships its links dynamic because a Skyrim trap has no
     #     script-held phase; ours must reproduce Oblivion's held phase instead.
+    # A held piece must ALSO be animated to ship keyframed.  Keyframed implies
+    # the D_ANIMATED collision flags (137) set below, and CLAUDE.md records the
+    # rule this violated: "a keyframed body with anim flags on a non-animated
+    # object flips the engine into the baked path and the whole compound acts
+    # welded solid".  ctraplogs01 has 6 bodies of which only 1 is animated, and
+    # ctrapcavein01 has 24 of which 2 are not -- shipping those non-animated
+    # ones keyframed froze the cell on load in Vilverin.
+    #
+    # A non-animated held piece is still HELD, just by the static branch (mass
+    # 0, ms=5).  It cannot be released to fall, which is the honest outcome:
+    # Oblivion moved it with its engine-side trap system, not with a clip.
+    #
+    # A CONSTRAINED island is the exception: its links are held rigid by the
+    # constraint solver, not by a clip, so they never needed anim flags.  Those
+    # keep the old behaviour (mass retained, released by the script) because
+    # that is the in-game-confirmed swinging-trap fix.
+    _animated = _node_is_animated(node, actual_root)
+    _constrained = _island_has_constraint(node, actual_root, rb)
     breakaway_body = (rb.motion_system == 6 and rb.mass > 0
+                      and (_animated or _constrained)
                       and (_node_is_breakaway(node, actual_root, rb)
                            or _node_is_held_trap(node, actual_root, rb)))
     keyframed_body = (rb.motion_system == 6
-                      and (_node_is_animated(node, actual_root)
-                           or breakaway_body))
+                      and (_animated or (breakaway_body and _constrained)))
     if rb.motion_system == 6 and not keyframed_body:
         rb.mass = 0.0               # case 3: falls into the static branch
 
